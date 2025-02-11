@@ -1,0 +1,9 @@
+[package]
+name = "solarsystem"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.15"
+bevy_enhanced_input = "0.7"
+big_space = "0.9"
