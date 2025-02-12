@@ -343,16 +343,6 @@ mod ico_mesh {
                 Mesh::ATTRIBUTE_POSITION,
                 vertices
                     .iter()
-                    .inspect(|x| {
-                        let expected = self.radius * *x - offset;
-                        let converted = expected.as_vec3();
-                        let actual = converted.as_dvec3();
-                        let difference = expected.distance(actual);
-                        println!(
-                            "Difference of {difference} at magnitude of {}",
-                            expected.length().log10()
-                        );
-                    })
                     .map(|x| (self.radius * x - offset).as_vec3())
                     .collect::<Vec<_>>(),
             )
