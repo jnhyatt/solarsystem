@@ -75,92 +75,6 @@ fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     });
 }
 
-// If the floating origin gets close to us, we want to add a marker that says we need to be
-// subdivided. But how do we know if we're already subdivided? We create another marker to track
-// that and keep it in sync. That means we need a system to sync the "needs subdivision" marker and
-// one to sync the "is subdivided" marker. We also need a system to subdivide faces with the "needs
-// subdivision" marker and no "is subdivided" marker, and one to remove the face's children when it
-// has the "is subdivided" marker and no "needs subdivision" marker.
-
-#[derive(Component)]
-struct NeedsSubdivision;
-
-#[derive(Component)]
-struct IsSubdivided([Entity; 4]);
-
-fn mark_for_subdivision(
-    floating_origin: Single<&GlobalTransform, With<FloatingOrigin>>,
-    faces: Query<(Entity, &GlobalTransform, &BoundingSphere)>,
-    mut commands: Commands,
-) {
-    let floating_origin = floating_origin.translation();
-    for (e, face_transform, &BoundingSphere(radius)) in &faces {
-        let needs_subdivision =
-            floating_origin.distance(face_transform.translation()) < radius * 2.0;
-        if needs_subdivision {
-            commands.entity(e).insert(NeedsSubdivision);
-        } else {
-            commands.entity(e).remove::<NeedsSubdivision>();
-        }
-    }
-}
-
-fn subdivide_faces(
-    faces: Query<
-        (Entity, &SubFace, &BoundingSphere),
-        (With<NeedsSubdivision>, Without<IsSubdivided>),
-    >,
-    grid_root: Single<(Entity, &Grid<P>), With<BigSpace>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut commands: Commands,
-) {
-    let (grid_root_entity, grid_root) = *grid_root;
-    for (e, sub_face, &BoundingSphere(radius)) in &faces {
-        // Limit the resolution so we don't subdivide into oblivion
-        if radius < 1.0 {
-            continue;
-        }
-        let sub_faces = sub_face.subdivide().map(|face| {
-            let mesh = face.mesh();
-            let (cell, offset) = grid_root.translation_to_grid(mesh.offset);
-            commands
-                .spawn((
-                    Mesh3d(meshes.add(mesh.mesh)),
-                    Wireframe,
-                    cell,
-                    Transform::from_translation(offset),
-                    BoundingSphere(mesh.radius),
-                    face,
-                ))
-                .id()
-        });
-        commands
-            .entity(e)
-            .insert((IsSubdivided(sub_faces), Visibility::Hidden));
-        commands.entity(grid_root_entity).add_children(&sub_faces);
-    }
-}
-
-fn recombine_faces(
-    faces: Query<(Entity, &IsSubdivided), (With<IsSubdivided>, Without<NeedsSubdivision>)>,
-    mut commands: Commands,
-) {
-    for (e, &IsSubdivided(sub_faces)) in &faces {
-        commands
-            .entity(e)
-            .remove::<IsSubdivided>()
-            // we use `try_insert` here because the face might already have been despawned below in
-            // a previous loop iteration
-            .try_insert(Visibility::Inherited);
-        for sub_face in sub_faces {
-            commands.entity(sub_face).despawn();
-        }
-    }
-}
-
-#[derive(Component, Clone, Copy)]
-struct BoundingSphere(f32);
-
 #[derive(Component)]
 struct SpeedText;
 
@@ -449,4 +363,90 @@ mod ico_mesh {
         pub offset: DVec3,
         pub radius: f32,
     }
+
+    // If the floating origin gets close to us, we want to add a marker that says we need to be
+    // subdivided. But how do we know if we're already subdivided? We create another marker to track
+    // that and keep it in sync. That means we need a system to sync the "needs subdivision" marker and
+    // one to sync the "is subdivided" marker. We also need a system to subdivide faces with the "needs
+    // subdivision" marker and no "is subdivided" marker, and one to remove the face's children when it
+    // has the "is subdivided" marker and no "needs subdivision" marker.
+
+    #[derive(Component)]
+    pub struct NeedsSubdivision;
+
+    #[derive(Component)]
+    pub struct IsSubdivided([Entity; 4]);
+
+    pub fn mark_for_subdivision(
+        floating_origin: Single<&GlobalTransform, With<FloatingOrigin>>,
+        faces: Query<(Entity, &GlobalTransform, &BoundingSphere)>,
+        mut commands: Commands,
+    ) {
+        let floating_origin = floating_origin.translation();
+        for (e, face_transform, &BoundingSphere(radius)) in &faces {
+            let needs_subdivision =
+                floating_origin.distance(face_transform.translation()) < radius * 2.0;
+            if needs_subdivision {
+                commands.entity(e).insert(NeedsSubdivision);
+            } else {
+                commands.entity(e).remove::<NeedsSubdivision>();
+            }
+        }
+    }
+
+    pub fn subdivide_faces(
+        faces: Query<
+            (Entity, &SubFace, &BoundingSphere),
+            (With<NeedsSubdivision>, Without<IsSubdivided>),
+        >,
+        grid_root: Single<(Entity, &Grid<P>), With<BigSpace>>,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut commands: Commands,
+    ) {
+        let (grid_root_entity, grid_root) = *grid_root;
+        for (e, sub_face, &BoundingSphere(radius)) in &faces {
+            // Limit the resolution so we don't subdivide into oblivion
+            if radius < 1.0 {
+                continue;
+            }
+            let sub_faces = sub_face.subdivide().map(|face| {
+                let mesh = face.mesh();
+                let (cell, offset) = grid_root.translation_to_grid(mesh.offset);
+                commands
+                    .spawn((
+                        Mesh3d(meshes.add(mesh.mesh)),
+                        Wireframe,
+                        cell,
+                        Transform::from_translation(offset),
+                        BoundingSphere(mesh.radius),
+                        face,
+                    ))
+                    .id()
+            });
+            commands
+                .entity(e)
+                .insert((IsSubdivided(sub_faces), Visibility::Hidden));
+            commands.entity(grid_root_entity).add_children(&sub_faces);
+        }
+    }
+
+    pub fn recombine_faces(
+        faces: Query<(Entity, &IsSubdivided), (With<IsSubdivided>, Without<NeedsSubdivision>)>,
+        mut commands: Commands,
+    ) {
+        for (e, &IsSubdivided(sub_faces)) in &faces {
+            commands
+                .entity(e)
+                .remove::<IsSubdivided>()
+                // we use `try_insert` here because the face might already have been despawned below in
+                // a previous loop iteration
+                .try_insert(Visibility::Inherited);
+            for sub_face in sub_faces {
+                commands.entity(sub_face).despawn();
+            }
+        }
+    }
+
+    #[derive(Component, Clone, Copy)]
+    pub struct BoundingSphere(pub f32);
 }
