@@ -1,5 +1,5 @@
 use bevy::{
-    asset::RenderAssetUsages,
+    hierarchy::ReportHierarchyIssue,
     math::{dvec3, DVec3},
     pbr::wireframe::{Wireframe, WireframePlugin},
     prelude::*,
@@ -7,10 +7,7 @@ use bevy::{
     window::CursorGrabMode,
 };
 use bevy_enhanced_input::prelude::*;
-use big_space::{
-    commands::BigSpaceCommands, floating_origins::FloatingOrigin, grid::Grid,
-    plugin::BigSpacePlugin,
-};
+use big_space::prelude::*;
 use controls::*;
 use ico_mesh::*;
 
@@ -19,11 +16,13 @@ type P = i64;
 fn main() {
     App::new()
         .add_plugins((
-            DefaultPlugins.build().disable::<TransformPlugin>(),
+            DefaultPlugins,
             WireframePlugin,
             EnhancedInputPlugin,
-            BigSpacePlugin::<P>::default(),
+            // TODO find out why validation is crashing when we despawn entities
+            BigSpacePlugin::<P>::new(false),
         ))
+        .insert_resource(ReportHierarchyIssue::<InheritedVisibility>::new(false))
         .add_input_context::<SpaceshipControls>()
         .add_observer(translation_input)
         .add_observer(rotation_input)
@@ -31,6 +30,10 @@ fn main() {
         .add_observer(capture_cursor_input)
         .add_systems(Startup, setup)
         .add_systems(Update, adjust_speed_text)
+        .add_systems(
+            Update,
+            (mark_for_subdivision, subdivide_faces, recombine_faces).chain(),
+        )
         .run();
 }
 
@@ -47,90 +50,116 @@ fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.spawn_big_space(Grid::<P>::new(1e-3, 0.0), |grid| {
         grid.spawn_spatial((
             SpaceshipControls,
-            Speed(1.0),
+            Speed(1e7),
             Camera3d::default(),
             Projection::Perspective(PerspectiveProjection {
                 near: 1e-8,
                 ..default()
             }),
-            Transform::from_xyz(0.0, 0.0, 10.0),
+            Transform::from_xyz(0.0, 0.0, 1e7),
             FloatingOrigin,
         ));
 
-        const PHI: f64 = 1.618033988749894848204586834365638117720309179805762862135448622;
-        let vertices = [
-            dvec3(0.0, -1.0, -PHI),
-            dvec3(0.0, -1.0, PHI),
-            dvec3(0.0, 1.0, -PHI),
-            dvec3(0.0, 1.0, PHI),
-            dvec3(-1.0, -PHI, 0.0),
-            dvec3(-1.0, PHI, 0.0),
-            dvec3(1.0, -PHI, 0.0),
-            dvec3(1.0, PHI, 0.0),
-            dvec3(-PHI, 0.0, -1.0),
-            dvec3(-PHI, 0.0, 1.0),
-            dvec3(PHI, 0.0, -1.0),
-            dvec3(PHI, 0.0, 1.0),
-        ]
-        .map(|x| x.normalize());
-        let mut faces = [
-            IcoFace::new(0, 2, 10),
-            IcoFace::new(0, 10, 6),
-            IcoFace::new(0, 6, 4),
-            IcoFace::new(0, 4, 8),
-            IcoFace::new(0, 8, 2),
-            IcoFace::new(3, 1, 11),
-            IcoFace::new(3, 11, 7),
-            IcoFace::new(3, 7, 5),
-            IcoFace::new(3, 5, 9),
-            IcoFace::new(3, 9, 1),
-            IcoFace::new(2, 7, 10),
-            IcoFace::new(2, 5, 7),
-            IcoFace::new(8, 5, 2),
-            IcoFace::new(8, 9, 5),
-            IcoFace::new(4, 9, 8),
-            IcoFace::new(4, 1, 9),
-            IcoFace::new(6, 1, 4),
-            IcoFace::new(6, 11, 1),
-            IcoFace::new(10, 11, 6),
-            IcoFace::new(10, 7, 11),
-        ]
-        .into_iter()
-        .map(|face| SubFace {
-            coords: [
-                FaceCoord {
-                    position: vertices[face.vertices[0]],
-                    barycentric_coords: [1.0, 0.0, 0.0],
-                },
-                FaceCoord {
-                    position: vertices[face.vertices[1]],
-                    barycentric_coords: [0.0, 1.0, 0.0],
-                },
-                FaceCoord {
-                    position: vertices[face.vertices[2]],
-                    barycentric_coords: [0.0, 0.0, 1.0],
-                },
-            ],
-            radius: 6.4e6, // Earth
-        })
-        .collect::<Vec<_>>();
-        for _ in 0..48 {
-            let new_faces = faces.pop().unwrap().subdivide();
-            faces.extend(new_faces);
-        }
-        for mesh in faces {
-            let mesh = mesh.mesh();
+        for face in icosphere(6.4e6) {
+            let mesh = face.mesh();
             let (cell, offset) = grid.grid().translation_to_grid(mesh.offset);
-            let mesh = meshes.add(mesh.mesh);
             grid.spawn_spatial((
-                Mesh3d(mesh),
+                Mesh3d(meshes.add(mesh.mesh)),
                 Wireframe,
                 cell,
                 Transform::from_translation(offset),
+                BoundingSphere(mesh.radius),
+                face,
             ));
         }
     });
 }
+
+// If the floating origin gets close to us, we want to add a marker that says we need to be
+// subdivided. But how do we know if we're already subdivided? We create another marker to track
+// that and keep it in sync. That means we need a system to sync the "needs subdivision" marker and
+// one to sync the "is subdivided" marker. We also need a system to subdivide faces with the "needs
+// subdivision" marker and no "is subdivided" marker, and one to remove the face's children when it
+// has the "is subdivided" marker and no "needs subdivision" marker.
+
+#[derive(Component)]
+struct NeedsSubdivision;
+
+#[derive(Component)]
+struct IsSubdivided([Entity; 4]);
+
+fn mark_for_subdivision(
+    floating_origin: Single<&GlobalTransform, With<FloatingOrigin>>,
+    faces: Query<(Entity, &GlobalTransform, &BoundingSphere)>,
+    mut commands: Commands,
+) {
+    let floating_origin = floating_origin.translation();
+    for (e, face_transform, &BoundingSphere(radius)) in &faces {
+        let needs_subdivision =
+            floating_origin.distance(face_transform.translation()) < radius * 2.0;
+        if needs_subdivision {
+            commands.entity(e).insert(NeedsSubdivision);
+        } else {
+            commands.entity(e).remove::<NeedsSubdivision>();
+        }
+    }
+}
+
+fn subdivide_faces(
+    faces: Query<
+        (Entity, &SubFace, &BoundingSphere),
+        (With<NeedsSubdivision>, Without<IsSubdivided>),
+    >,
+    grid_root: Single<(Entity, &Grid<P>), With<BigSpace>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut commands: Commands,
+) {
+    let (grid_root_entity, grid_root) = *grid_root;
+    for (e, sub_face, &BoundingSphere(radius)) in &faces {
+        // Limit the resolution so we don't subdivide into oblivion
+        if radius < 1.0 {
+            continue;
+        }
+        let sub_faces = sub_face.subdivide().map(|face| {
+            let mesh = face.mesh();
+            let (cell, offset) = grid_root.translation_to_grid(mesh.offset);
+            commands
+                .spawn((
+                    Mesh3d(meshes.add(mesh.mesh)),
+                    Wireframe,
+                    cell,
+                    Transform::from_translation(offset),
+                    BoundingSphere(mesh.radius),
+                    face,
+                ))
+                .id()
+        });
+        commands
+            .entity(e)
+            .insert((IsSubdivided(sub_faces), Visibility::Hidden));
+        commands.entity(grid_root_entity).add_children(&sub_faces);
+    }
+}
+
+fn recombine_faces(
+    faces: Query<(Entity, &IsSubdivided), (With<IsSubdivided>, Without<NeedsSubdivision>)>,
+    mut commands: Commands,
+) {
+    for (e, &IsSubdivided(sub_faces)) in &faces {
+        commands
+            .entity(e)
+            .remove::<IsSubdivided>()
+            // we use `try_insert` here because the face might already have been despawned below in
+            // a previous loop iteration
+            .try_insert(Visibility::Inherited);
+        for sub_face in sub_faces {
+            commands.entity(sub_face).despawn();
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy)]
+struct BoundingSphere(f32);
 
 #[derive(Component)]
 struct SpeedText;
@@ -238,7 +267,67 @@ mod controls {
 }
 
 mod ico_mesh {
+    use bevy::math::FloatOrd;
+
     use super::*;
+
+    pub fn icosphere(radius: f64) -> [SubFace; 20] {
+        const PHI: f64 = 1.618033988749894848204586834365638117720309179805762862135448622;
+        let vertices = [
+            dvec3(0.0, -1.0, -PHI),
+            dvec3(0.0, -1.0, PHI),
+            dvec3(0.0, 1.0, -PHI),
+            dvec3(0.0, 1.0, PHI),
+            dvec3(-1.0, -PHI, 0.0),
+            dvec3(-1.0, PHI, 0.0),
+            dvec3(1.0, -PHI, 0.0),
+            dvec3(1.0, PHI, 0.0),
+            dvec3(-PHI, 0.0, -1.0),
+            dvec3(-PHI, 0.0, 1.0),
+            dvec3(PHI, 0.0, -1.0),
+            dvec3(PHI, 0.0, 1.0),
+        ]
+        .map(|x| x.normalize());
+        [
+            IcoFace::new(0, 2, 10),
+            IcoFace::new(0, 10, 6),
+            IcoFace::new(0, 6, 4),
+            IcoFace::new(0, 4, 8),
+            IcoFace::new(0, 8, 2),
+            IcoFace::new(3, 1, 11),
+            IcoFace::new(3, 11, 7),
+            IcoFace::new(3, 7, 5),
+            IcoFace::new(3, 5, 9),
+            IcoFace::new(3, 9, 1),
+            IcoFace::new(2, 7, 10),
+            IcoFace::new(2, 5, 7),
+            IcoFace::new(8, 5, 2),
+            IcoFace::new(8, 9, 5),
+            IcoFace::new(4, 9, 8),
+            IcoFace::new(4, 1, 9),
+            IcoFace::new(6, 1, 4),
+            IcoFace::new(6, 11, 1),
+            IcoFace::new(10, 11, 6),
+            IcoFace::new(10, 7, 11),
+        ]
+        .map(|face| SubFace {
+            coords: [
+                FaceCoord {
+                    position: vertices[face.vertices[0]],
+                    barycentric_coords: [1.0, 0.0, 0.0],
+                },
+                FaceCoord {
+                    position: vertices[face.vertices[1]],
+                    barycentric_coords: [0.0, 1.0, 0.0],
+                },
+                FaceCoord {
+                    position: vertices[face.vertices[2]],
+                    barycentric_coords: [0.0, 0.0, 1.0],
+                },
+            ],
+            radius,
+        })
+    }
 
     #[derive(Clone, Copy)]
     pub struct FaceCoord {
@@ -275,6 +364,7 @@ mod ico_mesh {
 
     /// This represents any sub-face of arbitrary order of an icosphere. A 0th-order sub-face of e.g.
     /// face 0 is face 0. Each face has 4 1st order sub-faces, 16 2nd order sub-faces, and so on.
+    #[derive(Component, Clone, Copy)]
     pub struct SubFace {
         pub coords: [FaceCoord; 3],
         pub radius: f64,
@@ -331,25 +421,25 @@ mod ico_mesh {
                 .flat_map(|x| x.map(|x| x as u32)) // Flatten [[usize; 3]] -> [u32]
                 .collect::<Vec<_>>();
             let vertices = vertices.into_inner();
-            for x in &vertices {
-                assert!((x.length() - 1.0).abs() < 1e-13); // a micrometer at planet scale
-            }
             let offset = vertices.iter().sum::<DVec3>() * self.radius / (vertices.len() as f64);
-            let mesh = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            )
-            .with_inserted_attribute(
-                Mesh::ATTRIBUTE_POSITION,
-                vertices
-                    .iter()
-                    .map(|x| (self.radius * x - offset).as_vec3())
-                    .collect::<Vec<_>>(),
-            )
-            .with_inserted_indices(Indices::U32(faces))
-            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![Vec2::ZERO; vertices.len()])
-            .with_computed_normals();
-            BigMesh { mesh, offset }
+            let uvs = vec![Vec2::ZERO; vertices.len()];
+            let vertices = vertices
+                .iter()
+                .map(|x| (self.radius * x - offset).as_vec3())
+                .collect::<Vec<_>>();
+            let FloatOrd(radius) = vertices.iter().map(|x| FloatOrd(x.length())).max().unwrap();
+
+            let mesh = Mesh::new(PrimitiveTopology::TriangleList, default())
+                .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+                .with_inserted_indices(Indices::U32(faces))
+                .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+                .with_computed_normals();
+
+            BigMesh {
+                mesh,
+                offset,
+                radius,
+            }
         }
     }
 
@@ -357,5 +447,6 @@ mod ico_mesh {
     pub struct BigMesh {
         pub mesh: Mesh,
         pub offset: DVec3,
+        pub radius: f32,
     }
 }
