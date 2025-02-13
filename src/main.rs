@@ -1,7 +1,6 @@
 use bevy::{
     hierarchy::ReportHierarchyIssue,
     math::{dvec3, DVec3},
-    pbr::wireframe::{Wireframe, WireframePlugin},
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
     window::CursorGrabMode,
@@ -17,12 +16,12 @@ fn main() {
     App::new()
         .add_plugins((
             DefaultPlugins,
-            WireframePlugin,
             EnhancedInputPlugin,
             // TODO find out why validation is crashing when we despawn entities
             BigSpacePlugin::<P>::new(false),
         ))
         .insert_resource(ReportHierarchyIssue::<InheritedVisibility>::new(false))
+        .insert_resource(PlanetHeightMap(Box::new(NoiseHeightMap)))
         .add_input_context::<SpaceshipControls>()
         .add_observer(translation_input)
         .add_observer(rotation_input)
@@ -37,7 +36,11 @@ fn main() {
         .run();
 }
 
-fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
+fn setup(
+    mut commands: Commands,
+    height_map: Res<PlanetHeightMap>,
+    mut meshes: ResMut<Assets<Mesh>>,
+) {
     commands
         .spawn(Node {
             flex_direction: FlexDirection::Column,
@@ -47,7 +50,11 @@ fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
             parent.spawn((SpeedText, Text::new("Speed: 0m/s")));
             parent.spawn(Text::new("Press `Tab` to toggle cursor capture"));
         });
-    commands.spawn_big_space(Grid::<P>::new(1e-3, 0.0), |grid| {
+    commands.spawn((
+        DirectionalLight { ..default() },
+        Transform::IDENTITY.looking_to(Dir3::X, Dir3::Y),
+    ));
+    commands.spawn_big_space(Grid::<P>::new(1e3, 0.0), |grid| {
         grid.spawn_spatial((
             SpaceshipControls,
             Speed(1e7),
@@ -61,11 +68,11 @@ fn setup(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
         ));
 
         for face in icosphere(6.4e6) {
-            let mesh = face.mesh();
+            let mesh = face.mesh(height_map.0.as_ref());
             let (cell, offset) = grid.grid().translation_to_grid(mesh.offset);
             grid.spawn_spatial((
                 Mesh3d(meshes.add(mesh.mesh)),
-                Wireframe,
+                MeshMaterial3d::<StandardMaterial>::default(),
                 cell,
                 Transform::from_translation(offset),
                 BoundingSphere(mesh.radius),
@@ -89,6 +96,32 @@ fn adjust_speed_text(
         return;
     };
     ***text = format!("Speed: {}m/s", speed.0);
+}
+
+struct NoiseHeightMap;
+
+impl HeightMap for NoiseHeightMap {
+    fn properties(&self, location: &Location) -> HeightMapProperties {
+        // Our height will be a function of the three vertices that make up the face we're in.
+        // Specifically, we'll build a function for each vertex and evaluate each one for this
+        // point, then sum them together to get the final height. We should also hopefully be able
+        // to extract some gradient info, so we can fill in the normal, too.
+
+        let x = location.face.vertices.map(|v| {
+            // We represent coordinates on a sphere as normalized 3-vectors because they're the
+            // least weird.
+            let vertex_coord = VERTICES[v].normalize();
+            // To calculate our gradient vector, we first build an orthonormal basis where +X is
+            // east, +Y is up, and +Z is south. Then we hash `v` into a `Vec2` which we then stick
+            // into the XZ-plane of this basis. The result should be a `Vec3` that's tangent to the
+            // sphere at `v` and points in a random direction around the compass.
+        });
+
+        HeightMapProperties {
+            height: 0.0,
+            normal: Dir3::new_unchecked(location.normalized_position.as_vec3()),
+        }
+    }
 }
 
 mod controls {
@@ -185,46 +218,51 @@ mod ico_mesh {
 
     use super::*;
 
+    /// The golden friggin ratio.
+    pub const PHI: f64 = 1.618033988749894848204586834365638117720309179805762862135448622;
+
+    /// The un-normalized coordinates for the vertices of a regular icosahedron.
+    pub const VERTICES: [DVec3; 12] = [
+        dvec3(0.0, -1.0, -PHI),
+        dvec3(0.0, -1.0, PHI),
+        dvec3(0.0, 1.0, -PHI),
+        dvec3(0.0, 1.0, PHI),
+        dvec3(-1.0, -PHI, 0.0),
+        dvec3(-1.0, PHI, 0.0),
+        dvec3(1.0, -PHI, 0.0),
+        dvec3(1.0, PHI, 0.0),
+        dvec3(-PHI, 0.0, -1.0),
+        dvec3(-PHI, 0.0, 1.0),
+        dvec3(PHI, 0.0, -1.0),
+        dvec3(PHI, 0.0, 1.0),
+    ];
+
+    pub const FACES: [IcoFace; 20] = [
+        IcoFace::new(0, 2, 10),
+        IcoFace::new(0, 10, 6),
+        IcoFace::new(0, 6, 4),
+        IcoFace::new(0, 4, 8),
+        IcoFace::new(0, 8, 2),
+        IcoFace::new(3, 1, 11),
+        IcoFace::new(3, 11, 7),
+        IcoFace::new(3, 7, 5),
+        IcoFace::new(3, 5, 9),
+        IcoFace::new(3, 9, 1),
+        IcoFace::new(2, 7, 10),
+        IcoFace::new(2, 5, 7),
+        IcoFace::new(8, 5, 2),
+        IcoFace::new(8, 9, 5),
+        IcoFace::new(4, 9, 8),
+        IcoFace::new(4, 1, 9),
+        IcoFace::new(6, 1, 4),
+        IcoFace::new(6, 11, 1),
+        IcoFace::new(10, 11, 6),
+        IcoFace::new(10, 7, 11),
+    ];
+
     pub fn icosphere(radius: f64) -> [SubFace; 20] {
-        const PHI: f64 = 1.618033988749894848204586834365638117720309179805762862135448622;
-        let vertices = [
-            dvec3(0.0, -1.0, -PHI),
-            dvec3(0.0, -1.0, PHI),
-            dvec3(0.0, 1.0, -PHI),
-            dvec3(0.0, 1.0, PHI),
-            dvec3(-1.0, -PHI, 0.0),
-            dvec3(-1.0, PHI, 0.0),
-            dvec3(1.0, -PHI, 0.0),
-            dvec3(1.0, PHI, 0.0),
-            dvec3(-PHI, 0.0, -1.0),
-            dvec3(-PHI, 0.0, 1.0),
-            dvec3(PHI, 0.0, -1.0),
-            dvec3(PHI, 0.0, 1.0),
-        ]
-        .map(|x| x.normalize());
-        [
-            IcoFace::new(0, 2, 10),
-            IcoFace::new(0, 10, 6),
-            IcoFace::new(0, 6, 4),
-            IcoFace::new(0, 4, 8),
-            IcoFace::new(0, 8, 2),
-            IcoFace::new(3, 1, 11),
-            IcoFace::new(3, 11, 7),
-            IcoFace::new(3, 7, 5),
-            IcoFace::new(3, 5, 9),
-            IcoFace::new(3, 9, 1),
-            IcoFace::new(2, 7, 10),
-            IcoFace::new(2, 5, 7),
-            IcoFace::new(8, 5, 2),
-            IcoFace::new(8, 9, 5),
-            IcoFace::new(4, 9, 8),
-            IcoFace::new(4, 1, 9),
-            IcoFace::new(6, 1, 4),
-            IcoFace::new(6, 11, 1),
-            IcoFace::new(10, 11, 6),
-            IcoFace::new(10, 7, 11),
-        ]
-        .map(|face| SubFace {
+        let vertices = VERTICES.map(|x| x.normalize());
+        FACES.map(|face| SubFace {
             coords: [
                 FaceCoord {
                     position: vertices[face.vertices[0]],
@@ -269,7 +307,7 @@ mod ico_mesh {
     }
 
     impl IcoFace {
-        pub fn new(a: usize, b: usize, c: usize) -> Self {
+        pub const fn new(a: usize, b: usize, c: usize) -> Self {
             Self {
                 vertices: [a, b, c],
             }
@@ -309,37 +347,58 @@ mod ico_mesh {
             ]
         }
 
-        pub fn mesh(self) -> BigMesh {
-            let vertices = self
+        pub fn mesh(self, height_map: &dyn HeightMap) -> BigMesh {
+            let unit_sphere = self
                 .coords
                 .into_iter()
                 .map(|x| x.position)
                 .collect::<Vec<_>>();
             let faces = [[0, 1, 2]];
-            let vertices = std::cell::Cell::new(vertices);
+            let unit_sphere = std::cell::Cell::new(unit_sphere);
             let subdivide = |[a, b, c]: [usize; 3]| {
-                let mut my_vertices = vertices.take();
+                let mut my_vertices = unit_sphere.take();
                 my_vertices.push(my_vertices[a].midpoint(my_vertices[b]).normalize());
                 let ab = my_vertices.len() - 1;
                 my_vertices.push(my_vertices[b].midpoint(my_vertices[c]).normalize());
                 let bc = my_vertices.len() - 1;
                 my_vertices.push(my_vertices[c].midpoint(my_vertices[a]).normalize());
                 let ca = my_vertices.len() - 1;
-                vertices.set(my_vertices);
+                unit_sphere.set(my_vertices);
                 [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]
             };
             let faces = faces
                 .into_iter()
                 .flat_map(subdivide)
                 .flat_map(subdivide)
+                .flat_map(subdivide)
                 .flat_map(|x| x.map(|x| x as u32)) // Flatten [[usize; 3]] -> [u32]
                 .collect::<Vec<_>>();
-            let vertices = vertices.into_inner();
-            let offset = vertices.iter().sum::<DVec3>() * self.radius / (vertices.len() as f64);
+            let unit_sphere = unit_sphere.into_inner();
+            let vertices = unit_sphere
+                .into_iter()
+                .map(|x| {
+                    (
+                        x,
+                        height_map.properties(&Location {
+                            normalized_position: x,
+                            face: IcoFace { vertices: [0; 3] },
+                            barycentric_coordinates: [0.0; 3],
+                            scale: 1.0,
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let offset = vertices
+                .iter()
+                .map(|(x, props)| x * (self.radius + props.height))
+                .sum::<DVec3>()
+                / (vertices.len() as f64);
             let uvs = vec![Vec2::ZERO; vertices.len()];
+            let normals = vertices.iter().map(|(_, x)| *x.normal).collect::<Vec<_>>();
             let vertices = vertices
                 .iter()
-                .map(|x| (self.radius * x - offset).as_vec3())
+                .map(|(x, props)| (x * (self.radius + props.height) - offset).as_vec3())
                 .collect::<Vec<_>>();
             let FloatOrd(radius) = vertices.iter().map(|x| FloatOrd(x.length())).max().unwrap();
 
@@ -347,7 +406,7 @@ mod ico_mesh {
                 .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
                 .with_inserted_indices(Indices::U32(faces))
                 .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-                .with_computed_normals();
+                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
 
             BigMesh {
                 mesh,
@@ -394,12 +453,16 @@ mod ico_mesh {
         }
     }
 
+    #[derive(Resource)]
+    pub struct PlanetHeightMap(pub Box<dyn HeightMap + Send + Sync>);
+
     pub fn subdivide_faces(
         faces: Query<
             (Entity, &SubFace, &BoundingSphere),
             (With<NeedsSubdivision>, Without<IsSubdivided>),
         >,
         grid_root: Single<(Entity, &Grid<P>), With<BigSpace>>,
+        height_map: Res<PlanetHeightMap>,
         mut meshes: ResMut<Assets<Mesh>>,
         mut commands: Commands,
     ) {
@@ -410,12 +473,12 @@ mod ico_mesh {
                 continue;
             }
             let sub_faces = sub_face.subdivide().map(|face| {
-                let mesh = face.mesh();
+                let mesh = face.mesh(height_map.0.as_ref());
                 let (cell, offset) = grid_root.translation_to_grid(mesh.offset);
                 commands
                     .spawn((
                         Mesh3d(meshes.add(mesh.mesh)),
-                        Wireframe,
+                        MeshMaterial3d::<StandardMaterial>::default(),
                         cell,
                         Transform::from_translation(offset),
                         BoundingSphere(mesh.radius),
@@ -449,4 +512,22 @@ mod ico_mesh {
 
     #[derive(Component, Clone, Copy)]
     pub struct BoundingSphere(pub f32);
+
+    pub trait HeightMap {
+        fn properties(&self, location: &Location) -> HeightMapProperties;
+    }
+
+    pub struct Location {
+        pub normalized_position: DVec3,
+        pub face: IcoFace,
+        pub barycentric_coordinates: [f64; 3],
+        /// The approximate distance between sample points. This is important to sample maps at the
+        /// right resolution (basically the same problem space as mipmaps).
+        pub scale: f64,
+    }
+
+    pub struct HeightMapProperties {
+        pub height: f64,
+        pub normal: Dir3,
+    }
 }
