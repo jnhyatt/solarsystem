@@ -1,6 +1,6 @@
 use bevy::{
     hierarchy::ReportHierarchyIssue,
-    math::{dvec3, DVec3},
+    math::{dvec3, DMat3, DVec3},
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
     window::CursorGrabMode,
@@ -9,6 +9,7 @@ use bevy_enhanced_input::prelude::*;
 use big_space::prelude::*;
 use controls::*;
 use ico_mesh::*;
+use rand_pcg::Pcg32;
 
 type P = i64;
 
@@ -98,28 +99,127 @@ fn adjust_speed_text(
     ***text = format!("Speed: {}m/s", speed.0);
 }
 
+/// Our height will be simplex noise over an icosphere. This means our top-level grid cells are the
+/// 20 triangles that make up an icosahedron, projected onto a sphere. Each progressive noise octave
+/// uses cells with half the edge length of the previous, meaning cells for the n-th octave are just
+/// the triangles of the n-th icosphere subdivision. Each vertex contributes to the final noise
+/// function only in its immediate neighborhood, in this case the 5-6 triangles it touches.
+///
+/// Here's a list of terms so I have something I can reason about in English:
+///
+/// - **Contribution function**: The total contribution of a single vertex to the noise map. We get
+///   the value of the noise function by evaluating each contribution function at the given point
+///   and summing them together. In practice, for a given point, only three contribution functions
+///   will ever affect the final value, the others will be zero. So we find which three vertices
+///   might be affecting our point, evaluate their contribution functions, and sum them. This
+///   function is the product of the *gradient function* and the *falloff function*.
+/// - **Gradient function**: Each vertex has a random gradient associated with it. This is where the
+///   randomness in the noise comes from. The gradient is in "surface coordinates", meaning it's a
+///   2-dimensional direction on the compass. In theory, saying "it's a random direction" is good
+///   enough for math. In practice, we actually need those coordinates since we're in a computer and
+///   not an idealized math world. To compute this, we sample a random 2-vector from the boundary of
+///   a circle. Then we build a 3D basis at the vertex where Y points up. Doesn't matter where the
+///   other two point as long as it's consistent. Now we have a random 2D gradient from the
+///   surface's perspective. To sample the function, we can just take the dot product between this
+///   gradient and the offset to the point we're interested in, in the same basis. To figure out
+///   that offset, we can literally just take the 3D offset between the points, normalize it, then
+///   scale it by the great circle distance between the two points. Now we just transform it into
+///   the local space of that basis we built earlier and take the XZ components. Now we can just
+///   take the dot product of the gradient and the offset vector. We also have to scale down by the
+///   vertex influence distance to clamp the output to [0, 1].
+/// - **Falloff function*: This serves a couple purposes. The first is obviously to constrain the
+///   influence of the contribution function to just the neighboring faces. The next important one
+///   is to ensure that the noise function is smooth. In particular, we're aiming for C2 continuity.
+///   This means that the first and second derivatives are continuous. This property makes it easy
+///   to extract normals. We'll typically define this as $(1-d^2)^4$ where d (the great circle
+///   distance from the sample point to the vertex) is in [0, 1]. This gives us the continuity we're
+///   looking for, it satisfies $f(0)=1$ and $f(1)=0$, and it's cheap to compute.
+///
+/// So C(x)=G(x)F(x).
+/// G(X)=dot(g, d(p-v)/(f|p-v|))
+/// F(x)=(1-(d/f)^2)^4
 struct NoiseHeightMap;
 
 impl HeightMap for NoiseHeightMap {
     fn properties(&self, location: &Location) -> HeightMapProperties {
-        // Our height will be a function of the three vertices that make up the face we're in.
-        // Specifically, we'll build a function for each vertex and evaluate each one for this
-        // point, then sum them together to get the final height. We should also hopefully be able
-        // to extract some gradient info, so we can fill in the normal, too.
-
-        let x = location.face.vertices.map(|v| {
-            // We represent coordinates on a sphere as normalized 3-vectors because they're the
-            // least weird.
-            let vertex_coord = VERTICES[v].normalize();
-            // To calculate our gradient vector, we first build an orthonormal basis where +X is
-            // east, +Y is up, and +Z is south. Then we hash `v` into a `Vec2` which we then stick
-            // into the XZ-plane of this basis. The result should be a `Vec3` that's tangent to the
-            // sphere at `v` and points in a random direction around the compass.
-        });
+        // `result` is going to be the contributions to the value and gradient of the noise function
+        // from each vertex. We can just sum the value and gradient to figure out our height and
+        // normal.
+        let height = location
+            .face
+            .vertices
+            .map(|v| {
+                // We represent coordinates on a sphere as normalized 3-vectors because they're the
+                // least weird.
+                let vertex_coord = VERTICES[v].normalize();
+                let distance =
+                    vertex_coord.angle_between(location.normalized_position) * location.radius;
+                let influence = location.radius /* / 2.0.powi(octave) */;
+                // To calculate our gradient vector, we first build an orthonormal basis where +Y is up.
+                // Then we hash `v` into a compass direction. This is the gradient for `v`. We also
+                // find the compass direction from `v` to `location` and scale it by the great circle
+                // distance between the two points. This is the offset vector.
+                let basis = arbitrary_but_consistent_basis(vertex_coord);
+                // Let's create a new Pcg32 and seed it with the vertex index.
+                let mut rng = Pcg32::new(v as u64, v as u64);
+                let gradient = Circle::new(1.0).sample_boundary(&mut rng).as_dvec2();
+                // Transform offset to local space in the basis we just built.
+                let offset = basis.transpose() * (location.normalized_position - vertex_coord);
+                // Discard Y component and normalize, then scale by great circle distance.
+                let offset = offset.xz().normalize_or_zero() * distance / influence;
+                let gradient_function_result = gradient.dot(offset);
+                let falloff_function_result =
+                    (1.0 - (distance / influence).clamp(0.0, 1.0).powi(2)).powi(4);
+                gradient_function_result * falloff_function_result
+            })
+            .into_iter()
+            .sum::<f64>()
+            * 4e6;
 
         HeightMapProperties {
-            height: 0.0,
-            normal: Dir3::new_unchecked(location.normalized_position.as_vec3()),
+            height,
+            // normal: Dir3::new_unchecked(location.normalized_position.as_vec3()),
+        }
+    }
+}
+
+/// For a given position on the planet, we need a consistent, reproducible basis. There's no
+/// one convention that'll work for every point. What we'll do is use a different convention
+/// depending on whether we're above or below some arbitrary latitude. If we're below,
+/// there's no chance our up vector will coincide with global Y, so we use that. if we're
+/// above, there's no chance up will coincide with global X or Z, so we use one of those.
+/// I'm picking X because it's the first letter of "Xenonion". We can then use the cross
+/// product to find the other basis vectors. This will always give us the same basis for any
+/// given point.
+pub fn arbitrary_but_consistent_basis(coord: DVec3) -> DMat3 {
+    // TODO Remove this check with `DDir3`
+    let coord = coord.normalize();
+    let up = if coord.dot(DVec3::Y).abs() < 0.9 {
+        DVec3::Y
+    } else {
+        DVec3::X
+    };
+    let east = up.cross(coord).normalize();
+    let south = east.cross(coord);
+    DMat3::from_cols(east, coord, south)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{arbitrary_but_consistent_basis, ico_mesh::VERTICES};
+
+    #[test]
+    fn test_basis() {
+        for vertex in VERTICES {
+            let basis = arbitrary_but_consistent_basis(vertex);
+            assert!(basis.col(0).dot(basis.col(1)).abs() < 1e-6);
+            assert!(basis.col(1).dot(basis.col(2)).abs() < 1e-6);
+            assert!(
+                basis.determinant().abs() - 1.0 < 1e-6,
+                r#"Basis was orthogonal but columns were not unit length!
+Vertex: {vertex:?}
+Basis: {basis:#?}"#
+            );
         }
     }
 }
@@ -263,6 +363,7 @@ mod ico_mesh {
     pub fn icosphere(radius: f64) -> [SubFace; 20] {
         let vertices = VERTICES.map(|x| x.normalize());
         FACES.map(|face| SubFace {
+            face,
             coords: [
                 FaceCoord {
                     position: vertices[face.vertices[0]],
@@ -301,7 +402,7 @@ mod ico_mesh {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     pub struct IcoFace {
         pub vertices: [usize; 3],
     }
@@ -318,6 +419,7 @@ mod ico_mesh {
     /// face 0 is face 0. Each face has 4 1st order sub-faces, 16 2nd order sub-faces, and so on.
     #[derive(Component, Clone, Copy)]
     pub struct SubFace {
+        pub face: IcoFace,
         pub coords: [FaceCoord; 3],
         pub radius: f64,
     }
@@ -377,28 +479,21 @@ mod ico_mesh {
             let vertices = unit_sphere
                 .into_iter()
                 .map(|x| {
-                    (
-                        x,
-                        height_map.properties(&Location {
-                            normalized_position: x,
-                            face: IcoFace { vertices: [0; 3] },
-                            barycentric_coordinates: [0.0; 3],
-                            scale: 1.0,
-                        }),
-                    )
+                    let props = height_map.properties(&Location {
+                        normalized_position: x,
+                        face: self.face,
+                        radius: self.radius,
+                    });
+                    x * (self.radius + props.height)
                 })
                 .collect::<Vec<_>>();
 
-            let offset = vertices
-                .iter()
-                .map(|(x, props)| x * (self.radius + props.height))
-                .sum::<DVec3>()
-                / (vertices.len() as f64);
+            let offset = vertices.iter().sum::<DVec3>() / (vertices.len() as f64);
             let uvs = vec![Vec2::ZERO; vertices.len()];
-            let normals = vertices.iter().map(|(_, x)| *x.normal).collect::<Vec<_>>();
+            // let normals = vertices.iter().map(|(_, x)| *x.normal).collect::<Vec<_>>();
             let vertices = vertices
                 .iter()
-                .map(|(x, props)| (x * (self.radius + props.height) - offset).as_vec3())
+                .map(|x| (x - offset).as_vec3())
                 .collect::<Vec<_>>();
             let FloatOrd(radius) = vertices.iter().map(|x| FloatOrd(x.length())).max().unwrap();
 
@@ -406,7 +501,9 @@ mod ico_mesh {
                 .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
                 .with_inserted_indices(Indices::U32(faces))
                 .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-                .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+                // .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+                .with_duplicated_vertices()
+                .with_computed_flat_normals();
 
             BigMesh {
                 mesh,
@@ -517,17 +614,19 @@ mod ico_mesh {
         fn properties(&self, location: &Location) -> HeightMapProperties;
     }
 
+    #[derive(Clone, Copy, Debug)]
     pub struct Location {
         pub normalized_position: DVec3,
         pub face: IcoFace,
-        pub barycentric_coordinates: [f64; 3],
-        /// The approximate distance between sample points. This is important to sample maps at the
-        /// right resolution (basically the same problem space as mipmaps).
-        pub scale: f64,
+        // /// The approximate distance between sample points. This is important to sample maps at the
+        // /// right resolution (basically the same problem space as mipmaps).
+        // TODO we can actually derive scale from radius. In fact, they're almost equal. I'm just
+        // going to use radius for now.
+        pub radius: f64,
     }
 
     pub struct HeightMapProperties {
         pub height: f64,
-        pub normal: Dir3,
+        // pub normal: Dir3,
     }
 }
