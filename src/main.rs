@@ -22,7 +22,6 @@ fn main() {
             BigSpacePlugin::<P>::new(false),
         ))
         .insert_resource(ReportHierarchyIssue::<InheritedVisibility>::new(false))
-        .insert_resource(PlanetHeightMap(Box::new(NoiseHeightMap)))
         .add_input_context::<SpaceshipControls>()
         .add_observer(translation_input)
         .add_observer(rotation_input)
@@ -52,7 +51,7 @@ fn setup(
             parent.spawn(Text::new("Press `Tab` to toggle cursor capture"));
         });
     commands.spawn((
-        DirectionalLight { ..default() },
+        DirectionalLight::default(),
         Transform::IDENTITY.looking_to(Dir3::X, Dir3::Y),
     ));
     commands.spawn_big_space(Grid::<P>::new(1e3, 0.0), |grid| {
@@ -97,149 +96,6 @@ fn adjust_speed_text(
         return;
     };
     ***text = format!("Speed: {}m/s", speed.0);
-}
-
-/// Our height will be simplex noise over an icosphere. This means our top-level grid cells are the
-/// 20 triangles that make up an icosahedron, projected onto a sphere. Each progressive noise octave
-/// uses cells with half the edge length of the previous, meaning cells for the n-th octave are just
-/// the triangles of the n-th icosphere subdivision. Each vertex contributes to the final noise
-/// function only in its immediate neighborhood, in this case the 5-6 triangles it touches.
-///
-/// Here's a list of terms so I have something I can reason about in English:
-///
-/// - **Contribution function**: The total contribution of a single vertex to the noise map. We get
-///   the value of the noise function by evaluating each contribution function at the given point
-///   and summing them together. In practice, for a given point, only three contribution functions
-///   will ever affect the final value, the others will be zero. So we find which three vertices
-///   might be affecting our point, evaluate their contribution functions, and sum them. This
-///   function is the product of the *gradient function* and the *falloff function*.
-/// - **Gradient function**: Each vertex has a random gradient associated with it. This is where the
-///   randomness in the noise comes from. The gradient is in "surface coordinates", meaning it's a
-///   2-dimensional direction on the compass. In theory, saying "it's a random direction" is good
-///   enough for math. In practice, we actually need those coordinates since we're in a computer and
-///   not an idealized math world. To compute this, we sample a random 2-vector from the boundary of
-///   a circle. Then we build a 3D basis at the vertex where Y points up. Doesn't matter where the
-///   other two point as long as it's consistent. Now we have a random 2D gradient from the
-///   surface's perspective. To sample the function, we can just take the dot product between this
-///   gradient and the offset to the point we're interested in, in the same basis. To figure out
-///   that offset, we can literally just take the 3D offset between the points, normalize it, then
-///   scale it by the great circle distance between the two points. Now we just transform it into
-///   the local space of that basis we built earlier and take the XZ components. Now we can just
-///   take the dot product of the gradient and the offset vector. We also have to scale down by the
-///   vertex influence distance to clamp the output to [0, 1].
-/// - **Falloff function*: This serves a couple purposes. The first is obviously to constrain the
-///   influence of the contribution function to just the neighboring faces. The next important one
-///   is to ensure that the noise function is smooth. In particular, we're aiming for C2 continuity.
-///   This means that the first and second derivatives are continuous. This property makes it easy
-///   to extract normals. We'll typically define this as $(1-d^2)^4$ where d (the great circle
-///   distance from the sample point to the vertex) is in [0, 1]. This gives us the continuity we're
-///   looking for, it satisfies $f(0)=1$ and $f(1)=0$, and it's cheap to compute.
-///
-/// So C(x)=G(x)F(x).
-/// G(X)=dot(g, d(p-v)/(f|p-v|))
-/// F(x)=(1-(d/f)^2)^4
-struct NoiseHeightMap;
-
-impl HeightMap for NoiseHeightMap {
-    fn properties(&self, location: &Location) -> HeightMapProperties {
-        // `result` is going to be the contributions to the value and gradient of the noise function
-        // from each vertex. We can just sum the value and gradient to figure out our height and
-        // normal.
-        let height = location
-            .face
-            .vertices
-            .map(|v| {
-                // We represent coordinates on a sphere as normalized 3-vectors because they're the
-                // least weird.
-                let vertex_coord = VERTICES[v].normalize();
-                let distance =
-                    vertex_coord.angle_between(location.normalized_position) * location.radius;
-                let influence = location.radius /* / 2.0.powi(octave) */;
-                // To calculate our gradient vector, we first build an orthonormal basis where +Y is up.
-                // Then we hash `v` into a compass direction. This is the gradient for `v`. We also
-                // find the compass direction from `v` to `location` and scale it by the great circle
-                // distance between the two points. This is the offset vector.
-                let basis = arbitrary_but_consistent_basis(vertex_coord);
-                // Let's create a new Pcg32 and seed it with the vertex index.
-                let mut rng = Pcg32::new(v as u64, v as u64);
-                let gradient = Circle::new(1.0).sample_boundary(&mut rng).as_dvec2();
-                // Transform offset to local space in the basis we just built.
-                let offset = basis.transpose() * (location.normalized_position - vertex_coord);
-                // Discard Y component and normalize, then scale by great circle distance.
-                let offset = offset.xz().normalize_or_zero() * distance / influence;
-                let gradient_function_result = gradient.dot(offset);
-                let falloff_function_result =
-                    (1.0 - (distance / influence).clamp(0.0, 1.0).powi(2)).powi(4);
-                gradient_function_result * falloff_function_result
-            })
-            .into_iter()
-            .sum::<f64>()
-            * 4e6;
-
-        HeightMapProperties {
-            height,
-            // normal: Dir3::new_unchecked(location.normalized_position.as_vec3()),
-        }
-    }
-}
-
-/// This is me trying to generalize the algorithm above to make it less agonizing to look at.
-///
-/// In general, simplex noise is just a function that's a sum of contributions from different
-/// vertices. We need to know how the gradient function varies with respect to `x`, but `x` doesn't
-/// have to be euclidean space. We *are* going to constrain it somewhat: `G(x) : R^2 -> R`. It's
-/// going to do a dot product, so we'll have to define the gradient concretely as a 2-vector.
-///
-/// The falloff function needs to be able to determine the distance to each vertex, and we need some
-/// kind of "distance scale" that tells us how far a vertex's influence reaches.
-fn simplex_noise(corners: [Corner; 3], offset: DVec2, distance: f64, distance_scale: f64) -> f64 {
-    let distance = 
-    let scaled_distance = distance / distance_scale;
-    let offset = offset.xz().normalize_or_zero() * distance / influence;
-    let gradient_function_result = gradient.dot(offset);
-    let falloff_function_result = (1.0 - (distance / influence).clamp(0.0, 1.0).powi(2)).powi(4);
-    gradient_function_result * falloff_function_result
-}
-
-/// For a given position on the planet, we need a consistent, reproducible basis. There's no
-/// one convention that'll work for every point. What we'll do is use a different convention
-/// depending on whether we're above or below some arbitrary latitude. If we're below,
-/// there's no chance our up vector will coincide with global Y, so we use that. if we're
-/// above, there's no chance up will coincide with global X or Z, so we use one of those.
-/// I'm picking X because it's the first letter of "Xenonion". We can then use the cross
-/// product to find the other basis vectors. This will always give us the same basis for any
-/// given point.
-pub fn arbitrary_but_consistent_basis(coord: DVec3) -> DMat3 {
-    // TODO Remove this check with `DDir3`
-    let coord = coord.normalize();
-    let up = if coord.dot(DVec3::Y).abs() < 0.9 {
-        DVec3::Y
-    } else {
-        DVec3::X
-    };
-    let east = up.cross(coord).normalize();
-    let south = east.cross(coord);
-    DMat3::from_cols(east, coord, south)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{arbitrary_but_consistent_basis, ico_mesh::VERTICES};
-
-    #[test]
-    fn test_basis() {
-        for vertex in VERTICES {
-            let basis = arbitrary_but_consistent_basis(vertex);
-            assert!(basis.col(0).dot(basis.col(1)).abs() < 1e-6);
-            assert!(basis.col(1).dot(basis.col(2)).abs() < 1e-6);
-            assert!(
-                basis.determinant().abs() - 1.0 < 1e-6,
-                r#"Basis was orthogonal but columns were not unit length!
-Vertex: {vertex:?}
-Basis: {basis:#?}"#
-            );
-        }
-    }
 }
 
 mod controls {
@@ -332,9 +188,8 @@ mod controls {
 }
 
 mod ico_mesh {
-    use bevy::math::FloatOrd;
-
     use super::*;
+    use bevy::math::FloatOrd;
 
     /// The golden friggin ratio.
     pub const PHI: f64 = 1.618033988749894848204586834365638117720309179805762862135448622;
@@ -533,17 +388,14 @@ mod ico_mesh {
 
     #[derive(Clone)]
     pub struct BigMesh {
+        /// The mesh in single precision, centered at the origin.
         pub mesh: Mesh,
+        /// The offset from the origin. Before the mesh was recentered, this was the average of its
+        /// vertex positions.
         pub offset: DVec3,
+        /// The bounding radius of the mesh.
         pub radius: f32,
     }
-
-    // If the floating origin gets close to us, we want to add a marker that says we need to be
-    // subdivided. But how do we know if we're already subdivided? We create another marker to track
-    // that and keep it in sync. That means we need a system to sync the "needs subdivision" marker and
-    // one to sync the "is subdivided" marker. We also need a system to subdivide faces with the "needs
-    // subdivision" marker and no "is subdivided" marker, and one to remove the face's children when it
-    // has the "is subdivided" marker and no "needs subdivision" marker.
 
     #[derive(Component)]
     pub struct NeedsSubdivision;
