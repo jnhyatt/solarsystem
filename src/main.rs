@@ -1,6 +1,6 @@
 use bevy::{
     hierarchy::ReportHierarchyIssue,
-    math::{dvec3, DMat3, DVec3},
+    math::{dvec3, DMat3, DVec2, DVec3},
     prelude::*,
     render::mesh::{Indices, PrimitiveTopology},
     window::CursorGrabMode,
@@ -181,6 +181,24 @@ impl HeightMap for NoiseHeightMap {
             // normal: Dir3::new_unchecked(location.normalized_position.as_vec3()),
         }
     }
+}
+
+/// This is me trying to generalize the algorithm above to make it less agonizing to look at.
+///
+/// In general, simplex noise is just a function that's a sum of contributions from different
+/// vertices. We need to know how the gradient function varies with respect to `x`, but `x` doesn't
+/// have to be euclidean space. We *are* going to constrain it somewhat: `G(x) : R^2 -> R`. It's
+/// going to do a dot product, so we'll have to define the gradient concretely as a 2-vector.
+///
+/// The falloff function needs to be able to determine the distance to each vertex, and we need some
+/// kind of "distance scale" that tells us how far a vertex's influence reaches.
+fn simplex_noise(corners: [Corner; 3], offset: DVec2, distance: f64, distance_scale: f64) -> f64 {
+    let distance = 
+    let scaled_distance = distance / distance_scale;
+    let offset = offset.xz().normalize_or_zero() * distance / influence;
+    let gradient_function_result = gradient.dot(offset);
+    let falloff_function_result = (1.0 - (distance / influence).clamp(0.0, 1.0).powi(2)).powi(4);
+    gradient_function_result * falloff_function_result
 }
 
 /// For a given position on the planet, we need a consistent, reproducible basis. There's no
