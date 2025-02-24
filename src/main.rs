@@ -10,6 +10,7 @@ use big_space::prelude::*;
 use controls::*;
 use ico_mesh::*;
 use rand_pcg::Pcg32;
+use std::hash::Hasher;
 
 type P = i64;
 
@@ -145,41 +146,84 @@ impl HeightMap for NoiseHeightMap {
         // `result` is going to be the contributions to the value and gradient of the noise function
         // from each vertex. We can just sum the value and gradient to figure out our height and
         // normal.
-        let height = location
-            .face
-            .vertices
-            .map(|v| {
-                // We represent coordinates on a sphere as normalized 3-vectors because they're the
-                // least weird.
-                // `v` is a vertex index for the top-level icoface. We want to be able to pick
-                // an arbitrary subdivision of an icoface and a) generate a gradient for it, and
-                // b) determine the distance to it. To generate the gradient, we need a random
-                // u64 to seed the generator. To get distance, we just need the 3-vector coord.
-                // Influence is halved every octave we drop down.
-                let vertex_coord = VERTICES[v].normalize();
-                let distance =
-                    vertex_coord.angle_between(location.normalized_position) * location.radius;
-                let influence = location.radius /* / 2.0.powi(octave) */;
-                // To calculate our gradient vector, we first build an orthonormal basis where +Y is up.
-                // Then we hash `v` into a compass direction. This is the gradient for `v`. We also
-                // find the compass direction from `v` to `location` and scale it by the great circle
-                // distance between the two points. This is the offset vector.
-                let basis = arbitrary_but_consistent_basis(vertex_coord);
-                // Let's create a new Pcg32 and seed it with the vertex index.
-                let mut rng = Pcg32::new(v as u64, v as u64);
-                let gradient = Circle::new(1.0).sample_boundary(&mut rng).as_dvec2();
-                // Transform offset to local space in the basis we just built.
-                let offset = basis.transpose() * (location.normalized_position - vertex_coord);
-                // Discard Y component and normalize, then scale by great circle distance.
-                let offset = offset.xz().normalize_or_zero() * distance / influence;
-                let gradient_function_result = gradient.dot(offset);
-                let falloff_function_result =
-                    (1.0 - (distance / influence).clamp(0.0, 1.0).powi(2)).powi(4);
-                gradient_function_result * falloff_function_result
-            })
-            .into_iter()
-            .sum::<f64>()
-            * 4e6;
+        let mut height = 0.0;
+        let mut contributing_vertices = SubFace::top_level(location.face, location.radius);
+        let mut amplitude = 20e3; // 20km is the approximate height variation on Earth
+        const OCTAVES: usize = 20;
+        for octave in 0..OCTAVES {
+            height += amplitude
+                * contributing_vertices
+                    .coords
+                    .map(|corner| {
+                        let vertex_coord = corner.position;
+                        let distance = vertex_coord.angle_between(location.normalized_position)
+                            * location.radius;
+                        let influence = location.radius / 2.0f64.powi(octave as i32);
+                        let basis = arbitrary_but_consistent_basis(vertex_coord);
+                        // hash corner.position by converting each f64 -> bits, then hashing the 3-tuple of u64
+                        let mut hasher = std::hash::DefaultHasher::default();
+                        for corner in corner.position.to_array() {
+                            hasher.write_u64(corner.to_bits());
+                        }
+                        let seed = hasher.finish();
+                        let mut rng = Pcg32::new(seed, 17); // TODO
+                        let gradient = Circle::new(1.0).sample_boundary(&mut rng).as_dvec2();
+                        let offset =
+                            basis.transpose() * (location.normalized_position - vertex_coord);
+                        let offset = offset.xz().normalize_or_zero() * distance / influence;
+                        let gradient_function_result = gradient.dot(offset);
+                        let falloff_function_result =
+                            (1.0 - (distance / influence).clamp(0.0, 1.0).powi(2)).powi(4);
+                        gradient_function_result * falloff_function_result
+                    })
+                    .into_iter()
+                    .sum::<f64>();
+
+            // Make sure amplitude falls off slower than the chunk size, otherwise we'll never see
+            // detail. Also make sure it falls off close to the same speed as chunk size, otherwise
+            // we get *really* violent noise at small scales. 0.65 seems to work well.
+            amplitude *= 0.65;
+
+            // Here's the trick: our new contributing vertices depend on which sub-triangle we're
+            // in. We figure out which sub-triangle we're in based on barycentric coordinates: if
+            // any coordinate >0.5, we're in the sub-triangle that shares the vertex corresponding
+            // to that coordinate. For example, if our coordinate is (0.6, 0.3, 0.1), we're in the
+            // sub-triangle sharing the first vertex. If all coordinates are <0.5, we're in the
+            // middle sub-triangle.
+            //
+            // In order to recursively descend through octaves, we need to update the barycentric
+            // coordinates every iteration. We can actually transform barycentric coordinates in the
+            // parent triangle's coordinates to barycentric coordinates in the coordinates of any
+            // arbitrary sub-triangle as long as we know the barycentric coordinates of its corners.
+            // We do this the same way we create any world-to-local matrix: inverting the local-to-world
+            // matrix. We treat the parent as the "world transform". The standard basis in barycentric
+            // coordinates is just the three corners of the triangle. That means our local-to-world
+            // matrix is just the corners of the sub-triangle *in the parent's coordinates*. We already
+            // have those!!! So we create a matrix `M` where the columns are the corners of the
+            // sub-triangle in the parent's coordinates. We can literally just invert this and *BOOM*,
+            // now we can multiply it by any point in "world space", or the parent IcoFace's
+            // coordinates and we get the point in the sub-triangle's coordinates. We can then use
+            // this to figure out which sub-triangle we're in.
+
+            let sub_triangle_basis = DMat3::from_cols_array_2d(&[
+                contributing_vertices.coords[0].barycentric_coords,
+                contributing_vertices.coords[1].barycentric_coords,
+                contributing_vertices.coords[2].barycentric_coords,
+            ]);
+            let world_to_local = sub_triangle_basis.inverse();
+            let local_coords = world_to_local * DVec3::from(location.barycentric_coords);
+
+            let sub_face_index = if local_coords.x > 0.5 {
+                0
+            } else if local_coords.y > 0.5 {
+                1
+            } else if local_coords.z > 0.5 {
+                2
+            } else {
+                3
+            };
+            contributing_vertices = contributing_vertices.subdivide()[sub_face_index];
+        }
 
         HeightMapProperties {
             height,
@@ -366,25 +410,7 @@ mod ico_mesh {
     ];
 
     pub fn icosphere(radius: f64) -> [SubFace; 20] {
-        let vertices = VERTICES.map(|x| x.normalize());
-        FACES.map(|face| SubFace {
-            face,
-            coords: [
-                FaceCoord {
-                    position: vertices[face.vertices[0]],
-                    barycentric_coords: [1.0, 0.0, 0.0],
-                },
-                FaceCoord {
-                    position: vertices[face.vertices[1]],
-                    barycentric_coords: [0.0, 1.0, 0.0],
-                },
-                FaceCoord {
-                    position: vertices[face.vertices[2]],
-                    barycentric_coords: [0.0, 0.0, 1.0],
-                },
-            ],
-            radius,
-        })
+        FACES.map(|face| SubFace::top_level(face, radius))
     }
 
     #[derive(Clone, Copy)]
@@ -395,7 +421,7 @@ mod ico_mesh {
     }
 
     impl FaceCoord {
-        fn midpoint(self, right: Self) -> Self {
+        pub fn midpoint(self, right: Self) -> Self {
             Self {
                 position: self.position.midpoint(right.position).normalize(),
                 barycentric_coords: [
@@ -430,6 +456,28 @@ mod ico_mesh {
     }
 
     impl SubFace {
+        pub fn top_level(face: IcoFace, radius: f64) -> Self {
+            let vertices = VERTICES.map(|x| x.normalize());
+            Self {
+                face,
+                coords: [
+                    FaceCoord {
+                        position: vertices[face.vertices[0]],
+                        barycentric_coords: [1.0, 0.0, 0.0],
+                    },
+                    FaceCoord {
+                        position: vertices[face.vertices[1]],
+                        barycentric_coords: [0.0, 1.0, 0.0],
+                    },
+                    FaceCoord {
+                        position: vertices[face.vertices[2]],
+                        barycentric_coords: [0.0, 0.0, 1.0],
+                    },
+                ],
+                radius,
+            }
+        }
+
         pub fn subdivide(self) -> [Self; 4] {
             let ab = self.coords[0].midpoint(self.coords[1]);
             let bc = self.coords[1].midpoint(self.coords[2]);
@@ -477,7 +525,7 @@ mod ico_mesh {
 
             let mut vertices = self.coords.to_vec();
             let mut faces = vec![IndexedFace([0, 1, 2])];
-            const SUBDIVISIONS: usize = 3;
+            const SUBDIVISIONS: usize = 4;
             for _ in 0..SUBDIVISIONS {
                 faces = faces
                     .into_iter()
