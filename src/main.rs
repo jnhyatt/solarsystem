@@ -151,6 +151,11 @@ impl HeightMap for NoiseHeightMap {
             .map(|v| {
                 // We represent coordinates on a sphere as normalized 3-vectors because they're the
                 // least weird.
+                // `v` is a vertex index for the top-level icoface. We want to be able to pick
+                // an arbitrary subdivision of an icoface and a) generate a gradient for it, and
+                // b) determine the distance to it. To generate the gradient, we need a random
+                // u64 to seed the generator. To get distance, we just need the 3-vector coord.
+                // Influence is halved every octave we drop down.
                 let vertex_coord = VERTICES[v].normalize();
                 let distance =
                     vertex_coord.angle_between(location.normalized_position) * location.radius;
@@ -450,41 +455,49 @@ mod ico_mesh {
         }
 
         pub fn mesh(self, height_map: &dyn HeightMap) -> BigMesh {
-            let unit_sphere = self
-                .coords
-                .into_iter()
-                .map(|x| x.position)
-                .collect::<Vec<_>>();
-            let faces = [[0, 1, 2]];
-            let unit_sphere = std::cell::Cell::new(unit_sphere);
-            let subdivide = |[a, b, c]: [usize; 3]| {
-                let mut my_vertices = unit_sphere.take();
-                my_vertices.push(my_vertices[a].midpoint(my_vertices[b]).normalize());
-                let ab = my_vertices.len() - 1;
-                my_vertices.push(my_vertices[b].midpoint(my_vertices[c]).normalize());
-                let bc = my_vertices.len() - 1;
-                my_vertices.push(my_vertices[c].midpoint(my_vertices[a]).normalize());
-                let ca = my_vertices.len() - 1;
-                unit_sphere.set(my_vertices);
-                [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]
-            };
+            struct IndexedFace([usize; 3]);
+
+            impl IndexedFace {
+                fn subdivide(self, vertices: &mut Vec<FaceCoord>) -> [Self; 4] {
+                    let [a, b, c] = self.0;
+                    vertices.push(vertices[a].midpoint(vertices[b]));
+                    let ab = vertices.len() - 1;
+                    vertices.push(vertices[b].midpoint(vertices[c]));
+                    let bc = vertices.len() - 1;
+                    vertices.push(vertices[c].midpoint(vertices[a]));
+                    let ca = vertices.len() - 1;
+                    [
+                        Self([a, ab, ca]),
+                        Self([b, bc, ab]),
+                        Self([c, ca, bc]),
+                        Self([ab, bc, ca]),
+                    ]
+                }
+            }
+
+            let mut vertices = self.coords.to_vec();
+            let mut faces = vec![IndexedFace([0, 1, 2])];
+            const SUBDIVISIONS: usize = 3;
+            for _ in 0..SUBDIVISIONS {
+                faces = faces
+                    .into_iter()
+                    .flat_map(|x| x.subdivide(&mut vertices))
+                    .collect();
+            }
             let faces = faces
                 .into_iter()
-                .flat_map(subdivide)
-                .flat_map(subdivide)
-                .flat_map(subdivide)
-                .flat_map(|x| x.map(|x| x as u32)) // Flatten [[usize; 3]] -> [u32]
+                .flat_map(|IndexedFace(x)| x.map(|x| x as u32)) // Flatten [[usize; 3]] -> [u32]
                 .collect::<Vec<_>>();
-            let unit_sphere = unit_sphere.into_inner();
-            let vertices = unit_sphere
+            let vertices = vertices
                 .into_iter()
                 .map(|x| {
                     let props = height_map.properties(&Location {
-                        normalized_position: x,
+                        normalized_position: x.position,
+                        barycentric_coords: x.barycentric_coords,
                         face: self.face,
                         radius: self.radius,
                     });
-                    x * (self.radius + props.height)
+                    x.position * (self.radius + props.height)
                 })
                 .collect::<Vec<_>>();
 
@@ -617,6 +630,7 @@ mod ico_mesh {
     #[derive(Clone, Copy, Debug)]
     pub struct Location {
         pub normalized_position: DVec3,
+        pub barycentric_coords: [f64; 3],
         pub face: IcoFace,
         // /// The approximate distance between sample points. This is important to sample maps at the
         // /// right resolution (basically the same problem space as mipmaps).
